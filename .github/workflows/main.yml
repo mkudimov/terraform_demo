@@ -1,0 +1,121 @@
+name: main.CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+  workflow_dispatch:
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+jobs:
+  go_test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform Format
+        run: terraform fmt -check
+        working-directory: ./terraform
+        
+      - name: Terraform Init
+        run: terraform init
+        working-directory: ./terraform
+
+      - name: Terraform Validate
+        run: terraform validate -no-color
+        working-directory: ./terraform
+        
+      - name: Setup Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: ${{ matrix.go }}
+
+      - name: Install Go dependencies - terratest/aws
+        run: go get github.com/gruntwork-io/terratest/modules/aws
+     
+      - name: Install Go dependencies - testify
+        run: go get github.com/stretchr/testify/assert
+        
+      - name: Install Go dependencies - terratest/terraform
+        run: go get github.com/gruntwork-io/terratest/modules/terraform
+
+      - name: Run Go Test
+        run: go test -v ./...
+        
+  terraform_test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v2
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform Format
+        run: terraform fmt -check
+        working-directory: ./terraform
+        
+      - name: Terraform Init 
+        run: terraform init
+        working-directory: ./terraform
+
+      - name: Terraform Validate
+        run: terraform validate -no-color
+        working-directory: ./terraform
+      
+      - name: Terraform Plan
+        id: plan
+        if: github.event_name == 'pull_request'
+        run: terraform plan -no-color
+        continue-on-error: true
+        working-directory: ./terraform
+        
+      - name: Terraform Plan Status
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+        
+      - name: Terraform Apply
+        run: terraform apply -auto-approve
+        working-directory: ./terraform
+        
+      - name: Extract terraform output
+        id: terraform_output
+        run: echo "::set-output name=app_url::$(terraform output -raw application_url)"
+        working-directory: ./terraform
+        
+      - name: Sleep for 90 seconds (wait for server deploying)
+        uses: jakejarvis/wait-action@master
+        with:
+          time: '90s'
+        
+      - name: Check ec2manager service - tags endpoint
+        run: curl "${{ steps.terraform_output.outputs.app_url }}/tags"
+        
+      - name: Shutdown ec2manager service
+        run: curl "${{ steps.terraform_output.outputs.app_url }}/shutdown"
+        continue-on-error: true
+        
+      - name: Check ec2manager service - tags endpoint
+        id: ec2manager_status
+        run: curl "${{ steps.terraform_output.outputs.app_url }}/tags"
+        continue-on-error: true 
+        
+      - name: Ensure ec2manager_status failed
+        if: steps.ec2manager_status.outcome != 'failure' 
+        run: exit code 1
+        
+      - name: Clean up
+        if: always()
+        run: terraform destroy -auto-approve
+        working-directory: ./terraform
